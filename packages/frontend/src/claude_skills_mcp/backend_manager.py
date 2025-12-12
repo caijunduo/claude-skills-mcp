@@ -41,6 +41,28 @@ class BackendManager:
         self.backend_host = host
         self.backend_process: Optional[asyncio.subprocess.Process] = None
         self.backend_url: Optional[str] = None
+        self._external_backend_url: Optional[str] = None
+
+    def get_backend_url_from_env(self) -> Optional[str]:
+        """Get backend URL from BACKEND_URL environment variable.
+
+        Returns
+        -------
+        str | None
+            Backend URL with /mcp suffix if BACKEND_URL is set, None otherwise.
+            If BACKEND_URL is a base URL (without /mcp), it will be appended.
+        """
+        backend_url_env = os.getenv("BACKEND_URL")
+        if not backend_url_env:
+            return None
+
+        # Normalize the URL: remove trailing slash and add /mcp if not present
+        backend_url_env = backend_url_env.rstrip("/")
+        if not backend_url_env.endswith("/mcp"):
+            backend_url_env = f"{backend_url_env}/mcp"
+
+        logger.info(f"Using backend URL from BACKEND_URL environment variable: {backend_url_env}")
+        return backend_url_env
 
     def check_backend_available(self) -> bool:
         """Check if backend package is available via uvx.
@@ -141,24 +163,34 @@ class BackendManager:
         except Exception as e:
             logger.error(f"Stream consumer {prefix} error after {line_count} lines: {e}")
 
-    async def _wait_for_health(self, timeout: int = 300) -> None:
+    async def _wait_for_health(self, timeout: int = 300, health_url: Optional[str] = None) -> None:
         """Wait for backend health check to pass AND skills to be loaded.
 
         Parameters
         ----------
         timeout : int, optional
             Maximum time to wait in seconds, by default 300 (5 minutes).
+        health_url : str | None, optional
+            Custom health check URL. If None, uses default based on host/port.
 
         Raises
         ------
         TimeoutError
             If backend doesn't become healthy within timeout.
         """
-        health_url = f"http://{self.backend_host}:{self.backend_port}/health"
+        if health_url is None:
+            health_url = f"http://{self.backend_host}:{self.backend_port}/health"
         start_time = asyncio.get_event_loop().time()
 
         last_error = None
         while True:
+            # Check timeout first
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > timeout:
+                raise TimeoutError(
+                    f"Backend failed to start within {timeout}s. Last error: {last_error}"
+                )
+
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     response = await client.get(health_url)
@@ -185,13 +217,6 @@ class BackendManager:
             except Exception as e:
                 last_error = str(e)
 
-            # Check timeout
-            elapsed = asyncio.get_event_loop().time() - start_time
-            if elapsed > timeout:
-                raise TimeoutError(
-                    f"Backend failed to start within {timeout}s. Last error: {last_error}"
-                )
-
             # Show progress
             if int(elapsed) % 10 == 0 and int(elapsed) > 0:
                 logger.info(f"Waiting for backend... ({int(elapsed)}s elapsed)")
@@ -199,21 +224,49 @@ class BackendManager:
             await asyncio.sleep(1)
 
     async def ensure_backend_running(self, backend_args: list[str]) -> str:
-        """Ensure backend is running via uvx.
+        """Ensure backend is running via uvx or connect to external backend.
 
-        Always kills any existing backend and spawns fresh to avoid version
-        mismatches and state issues. Simpler and more robust than reuse logic.
+        If BACKEND_URL environment variable is set, connects to that URL directly
+        without starting a local backend. Otherwise, starts local backend via uvx.
 
         Parameters
         ----------
         backend_args : list[str]
-            CLI arguments to forward to backend.
+            CLI arguments to forward to backend (ignored if using external URL).
 
         Returns
         -------
         str
             Backend URL.
+
+        Raises
+        ------
+        RuntimeError
+            If external backend URL is set but connection fails.
         """
+        # Check for BACKEND_URL environment variable first
+        external_url = self.get_backend_url_from_env()
+        if external_url:
+            logger.info(f"Using external backend from BACKEND_URL: {external_url}")
+            self._external_backend_url = external_url
+            
+            # Verify the external backend is accessible
+            # Extract base URL for health check (remove /mcp suffix)
+            health_base_url = external_url.rstrip("/mcp").rstrip("/")
+            health_url = f"{health_base_url}/health"
+            
+            try:
+                logger.info(f"Verifying external backend health at {health_url}...")
+                await self._wait_for_health(timeout=30, health_url=health_url)
+                logger.info(f"External backend verified and ready at {external_url}")
+                self.backend_url = external_url
+                return external_url
+            except Exception as e:
+                error_msg = f"Failed to connect to external backend at {external_url}: {e}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg) from e
+
+        # No BACKEND_URL set, use local backend
         # Always kill any existing backend on this port before starting
         # This ensures clean state and no version mismatches
         logger.info(f"Cleaning port {self.backend_port} before starting backend...")
@@ -247,7 +300,16 @@ class BackendManager:
             logger.debug(f"Error during port cleanup: {e}")
 
     async def cleanup(self) -> None:
-        """Cleanup backend process and all child processes."""
+        """Cleanup backend process and all child processes.
+        
+        Only cleans up local backend process. External backends (via BACKEND_URL)
+        are not managed by this class and should not be cleaned up.
+        """
+        # Only cleanup if we started a local backend process
+        if self._external_backend_url:
+            logger.info("Using external backend, skipping cleanup")
+            return
+            
         if self.backend_process:
             # Kill backend process group
             try:

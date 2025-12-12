@@ -26,6 +26,8 @@ pip install claude-skills-mcp
 
 ## Usage with Cursor
 
+### Quick Setup (Auto-download mode)
+
 Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
 
 ```json
@@ -67,14 +69,34 @@ uvx claude-skills-mcp --verbose
 uvx claude-skills-mcp --port 9000
 ```
 
-## Remote Backend (Future)
+## Remote Backend via Environment Variable
+
+You can connect to an external backend server using the `BACKEND_URL` environment variable. This skips the local backend download and startup process:
 
 ```bash
-# Connect to hosted backend instead of local
-uvx claude-skills-mcp --remote https://skills.k-dense.ai/mcp
+# Connect to external backend (base URL, /mcp will be added automatically)
+export BACKEND_URL=http://localhost:8765
+uvx claude-skills-mcp
+
+# Or with full MCP endpoint URL
+export BACKEND_URL=http://localhost:8765/mcp
+uvx claude-skills-mcp
+
+# In Cursor MCP settings, you can set environment variables:
+# {
+#   "mcpServers": {
+#     "claude-skills": {
+#       "command": "uvx",
+#       "args": ["claude-skills-mcp"],
+#       "env": {
+#         "BACKEND_URL": "http://localhost:8765"
+#       }
+#     }
+#   }
+# }
 ```
 
-**Note**: Remote backend support coming in v1.1.0
+**Note**: If `BACKEND_URL` is set but the connection fails, the frontend will raise an error and not fall back to local backend startup.
 
 ## How It Works
 
